@@ -267,12 +267,13 @@ int main(void) {
 
     funcAddr = GetFunc(unhookModule, funcName);
     if (funcAddr == NULL) {
-        printf("Error retrieving address of func");
+        printf("Error retrieving address of func\n");
         return -1;
     }
 
     firstJmp = FindHook(funcAddr, funcName);
     if (firstJmp == NULL) {
+        printf("Function does not appear to be hooked\n");
         return -1;
     }
 
