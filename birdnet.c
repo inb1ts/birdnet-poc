@@ -237,7 +237,6 @@ BOOL PatchHeapAddr(BYTE * landingAddr, VOID * targetAddr) {
 
     // We then perform the same actions the loop does, adding 0x45 for each value previously pushed to the stack, and adding 0x28 on the end.
     patchAddr = initialHeapAddr + (0x45 * (stackValCounter)) + 0x28;
-    printf("patchAddr: %p\nPress enter to patch...\n", patchAddr);
 
     *patchAddr = targetAddr;
 
